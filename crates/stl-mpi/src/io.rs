@@ -567,3 +567,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Reads the orientation-aligned frame of a pyramid rooted at `nside`: the
+/// `angle_dg<d>.npy` files of `dir`, one `f32` per pixel in NESTED order, for
+/// levels `0..` until the first missing file (ADR 0002).  An empty directory
+/// is an error; absent coarser levels keep the sky frame.
+pub fn read_rotation(dir: &Path, nside: i64) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::new();
+    for dg in 0..(64 - (nside as u64).leading_zeros() as usize) {
+        let path = dir.join(format!("angle_dg{dg}.npy"));
+        if !path.exists() {
+            if dg == 0 {
+                return Err(format!("{}: no angle_dg0.npy", dir.display()));
+            }
+            break;
+        }
+        let values = read_npy(&path)?;
+        let n = (nside >> dg).max(1);
+        let want = (12 * n * n) as usize;
+        if values.len() != want {
+            return Err(format!(
+                "{}: {} values for level {dg} of nside {nside}, expected {want}",
+                path.display(),
+                values.len()
+            ));
+        }
+        out.push(values.into_iter().map(|v| v as f32).collect());
+    }
+    Ok(out)
+}

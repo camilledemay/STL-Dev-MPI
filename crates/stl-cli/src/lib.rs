@@ -28,6 +28,7 @@ mod marginal;
 pub mod minkowski;
 pub mod ensemble;
 pub mod planar;
+pub mod rotation;
 use kappa::Transform;
 use kurtosis::Kurtosis;
 use level_power::LevelPower;
@@ -53,6 +54,9 @@ stl-synth --target MAP [options]
   --block-pixels N      block size per level (default 16384)
   --overlap N           overlapping patches: levels < N evaluated with redundant halos (no
                         exchange during the sweeps), levels >= N on rank 0; for a few ranks
+  --rotation DIR        orientation-aligned frame: the per-level angle_dg<d>.npy of DIR
+                        (stl-rotation) turn every stencil by the pixel's local preferred
+                        direction (ADR 0002; default: the sky frame)
   --conv-chunk N        rebuild the convolution geometry by sub-blocks of N rows at every
                         application (less memory, more time; default: whole block)
   --niter N             L-BFGS iterations (default 50)
@@ -196,6 +200,8 @@ pub struct Args {
     /// `--conv-chunk`: rebuild the convolution geometry by sub-blocks of this
     /// many rows (`None`: whole block).
     pub conv_chunk: Option<usize>,
+    /// `--rotation`: directory of the orientation-aligned frame (`angle_dg<d>.npy`).
+    pub rotation: Option<PathBuf>,
     /// `--overlap`: levels below it evaluated on overlapping patches with
     /// redundant halos, the others on rank 0 (`None`: halo exchange).
     pub overlap: Option<usize>,
@@ -300,6 +306,7 @@ impl Args {
             fewer: false,
             block_pixels: 16384,
             conv_chunk: None,
+            rotation: None,
             overlap: None,
             ergodic_weights: false,
             family_weights: Vec::new(),
@@ -360,6 +367,7 @@ impl Args {
                 "--fewer" => a.fewer = true,
                 "--block-pixels" => a.block_pixels = num(it.next(), k)?,
                 "--conv-chunk" => a.conv_chunk = Some(num(it.next(), k)?),
+                "--rotation" => a.rotation = Some(PathBuf::from(it.next().ok_or("--rotation needs a directory")?)),
                 "--overlap" => a.overlap = Some(num(it.next(), k)?),
                 "--weights" => {
                     a.ergodic_weights = match it.next().map(String::as_str) {
@@ -563,6 +571,9 @@ pub fn run<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json::Value>, 
     let j = args.j.unwrap_or_else(|| (64 - (nside as u64).leading_zeros() as usize).saturating_sub(2).max(1));
     let mut geo = LocalGeometry::new(nside, args.kernel_size, args.l, Gauge::Cosmo, args.block_pixels);
     geo.conv_chunk = args.conv_chunk;
+    if let Some(dir) = &args.rotation {
+        geo.set_rotation(stl_mpi::io::read_rotation(dir, nside)?);
+    }
     let mut cfg = EngineConfig::new(j, args.fewer);
     if let Some(coarse) = args.overlap {
         if args.gpu {
@@ -1288,6 +1299,9 @@ pub fn statistics_of_maps<C: Comm>(args: &Args, maps: &[PathBuf], norm: Option<&
     let j = args.j.unwrap_or_else(|| (64 - (nside as u64).leading_zeros() as usize).saturating_sub(2).max(1));
     let mut geo = LocalGeometry::new(nside, args.kernel_size, args.l, Gauge::Cosmo, args.block_pixels);
     geo.conv_chunk = args.conv_chunk;
+    if let Some(dir) = &args.rotation {
+        geo.set_rotation(stl_mpi::io::read_rotation(dir, nside)?);
+    }
     let cfg = EngineConfig::new(j, args.fewer);
     let plan = build_plan(j, args.l, &cfg.j_to_dg, 1, None, &Family::ALL);
     let started = Instant::now();

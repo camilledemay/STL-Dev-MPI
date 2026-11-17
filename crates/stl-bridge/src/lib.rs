@@ -131,7 +131,9 @@ pub unsafe extern "C" fn stlp_string_free(p: *mut c_char) {
 
 /// New handle from a JSON configuration: `nside`, `j` (scales), `batch`,
 /// `kernel` (5), `orientations` (4), `block_pixels` (4096), `backend`
-/// (`cpu` | `gpu`); GPU only: `device` (0), `cache` (`transposition`),
+/// (`cpu` | `gpu`), `rotation` (directory of the orientation-aligned frame,
+/// ADR 0002: the `angle_dg<d>.npy` files of `stl-rotation`); GPU only:
+/// `device` (0), `cache` (`transposition`),
 /// `cache_bytes` (1 GiB), `threads` (1), `conv` (`dia` | `stencils`) and
 /// `fields` (`auto` | `keep` | `recompute`), else `STL_GPU_CONV`,
 /// `STL_GPU_FIELDS` or their defaults.  Null on failure.
@@ -146,13 +148,18 @@ pub unsafe extern "C" fn stlp_new(config: *const c_char) -> *mut Handle {
         let batch = integer(&v, "batch", 1);
         assert!(batch > 0, "batch must be positive");
         let block_pixels = integer(&v, "block_pixels", 4096);
-        let geo = Box::new(LocalGeometry::new(
+        let mut geo = Box::new(LocalGeometry::new(
             nside as i64,
             integer(&v, "kernel", 5),
             integer(&v, "orientations", 4),
             Gauge::Cosmo,
             block_pixels,
         ));
+        if let Some(dir) = v["rotation"].as_str() {
+            geo.set_rotation(
+                stl_mpi::io::read_rotation(std::path::Path::new(dir), nside as i64).expect("rotation field"),
+            );
+        }
         let cfg = Box::new(EngineConfig::new(j, false));
         let plan = build_plan(j, geo.l, &cfg.j_to_dg, 1, None, &Family::ALL);
         let npix = 12 * nside * nside;

@@ -47,8 +47,13 @@ pub fn local_kernel_grid(kernel_sz: usize, nside: i64) -> Vec<[f64; 3]> {
 }
 
 /// Rotations `[G]` taking the North-Pole stencil to the pixel `(theta, phi)`
-/// for each of the `G` gauges (orientations `g * pi / G`).
-pub fn rotation_matrices(theta: f64, phi: f64, g_count: usize, gauge: Gauge) -> Vec<Mat3> {
+/// for each of the `G` gauges (orientations `g * pi / G`), then turned by
+/// `offset` radians more (`rotation_matrices` with `offset = 0`).
+///
+/// The offset is applied in the gauge's own sense (`sign_g`), so that the
+/// gauges of the rotated frame are `offset + g * pi / G`: an offset of
+/// `pi / G` moves every gauge onto its neighbour (`aligned_frame` test).
+pub fn rotation_matrices_offset(theta: f64, phi: f64, g_count: usize, gauge: Gauge, offset: f64) -> Vec<Mat3> {
     let (ct, st) = (theta.cos(), theta.sin());
     let (cp, sp) = (phi.cos(), phi.sin());
     let base: Mat3 = [
@@ -73,7 +78,7 @@ pub fn rotation_matrices(theta: f64, phi: f64, g_count: usize, gauge: Gauge) -> 
     let step = PI / g_count as f64;
     (0..g_count)
         .map(|g| {
-            let alpha = alpha_base + sign_g * (g as f64 * step);
+            let alpha = alpha_base + sign_g * (g as f64 * step + offset);
             let (ca, sa) = (alpha.cos(), alpha.sin());
             let mut rg = [[0.0; 3]; 3];
             for i in 0..3 {
@@ -85,6 +90,13 @@ pub fn rotation_matrices(theta: f64, phi: f64, g_count: usize, gauge: Gauge) -> 
             matmul(&rg, &base)
         })
         .collect()
+}
+
+/// Rotations `[G]` taking the North-Pole stencil to the pixel `(theta, phi)`
+/// for each of the `G` gauges (orientations `g * pi / G`), without a local
+/// preferred direction.
+pub fn rotation_matrices(theta: f64, phi: f64, g_count: usize, gauge: Gauge) -> Vec<Mat3> {
+    rotation_matrices_offset(theta, phi, g_count, gauge, 0.0)
 }
 
 /// Matrix product `a b`.

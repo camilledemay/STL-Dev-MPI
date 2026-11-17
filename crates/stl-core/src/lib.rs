@@ -8,6 +8,7 @@
 
 #![warn(missing_docs)]
 
+pub mod aligned;
 pub mod conv;
 pub mod decimation;
 pub mod dia;

@@ -16,6 +16,7 @@ gpu = ["dep:stl-gpu"]
 
 [dependencies]
 stl-core = { path = "../stl-core" }
+stl-mpi = { path = "../stl-mpi" }
 stl-gpu = { path = "../stl-gpu", optional = true }
 num-complex.workspace = true
 serde_json.workspace = true

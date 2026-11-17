@@ -40,3 +40,7 @@ path = "src/bin/stl-synth2d.rs"
 [[bin]]
 name = "stl-stats"
 path = "src/bin/stl-stats.rs"
+
+[[bin]]
+name = "stl-rotation"
+path = "src/bin/stl-rotation.rs"

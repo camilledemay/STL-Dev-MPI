@@ -12,8 +12,14 @@
 //! every application, bounding it by the sub-block size.
 
 use crate::healpix::{deg2rad, interp_weights_nested, order_of, pix2ang_nest, rad2deg};
-use crate::stencil::{apply, local_kernel_grid, rotation_matrices, Gauge};
+use crate::stencil::{apply, local_kernel_grid, rotation_matrices_offset, Gauge};
 use std::f64::consts::PI;
+use std::sync::Arc;
+
+/// Per-pixel rotation offsets of the wavelet stencil, in radians, indexed by
+/// NESTED cell id at the level's `nside` (the orientation-aligned frame of
+/// ADR 0002).  One array per level.
+pub type AngleField = Arc<Vec<f32>>;
 
 /// Bound stencils of output rows `rows` reading the sorted grid `grid`.
 ///
@@ -61,6 +67,21 @@ impl ConvGeometry {
     /// the output) reading the grid `grid` (sorted, unique).  Row `k` is the
     /// row of `rows[k]` in `TorchConv(grid, ...)` when `rows[k]` is in `grid`.
     pub fn rows(grid: &[i64], rows: &[i64], nside: i64, kernel_sz: usize, g_count: usize, gauge: Gauge) -> Self {
+        Self::rows_rotated(grid, rows, nside, kernel_sz, g_count, gauge, None)
+    }
+
+    /// [`rows`](Self::rows) on the orientation-aligned frame: every output
+    /// row `k` has its stencil turned by `offset[rows[k]]` radians, so that
+    /// gauge 0 lies along the pixel's local preferred direction.
+    pub fn rows_rotated(
+        grid: &[i64],
+        rows: &[i64],
+        nside: i64,
+        kernel_sz: usize,
+        g_count: usize,
+        gauge: Gauge,
+        offset: Option<&[f32]>,
+    ) -> Self {
         assert!(grid.windows(2).all(|w| w[0] < w[1]), "cell ids must be sorted and unique");
         assert!(grid.len() < u32::MAX as usize, "grid too large for u32 positions");
         let order = order_of(nside);
@@ -80,7 +101,13 @@ impl ConvGeometry {
             // The library rounds pixel centres through degrees (healpix_geo output).
             let theta = deg2rad(90.0 - rad2deg(PI / 2.0 - theta));
             let phi = deg2rad(rad2deg(phi));
-            for (g, r) in rotation_matrices(theta, phi, gg, gauge).iter().enumerate() {
+            let angle = match offset {
+                Some(a) => a.get(id as usize).copied().unwrap_or_else(|| {
+                    panic!("angle field has {} pixels, pixel {id} at nside {nside} is missing", a.len())
+                }) as f64,
+                None => 0.0,
+            };
+            for (g, r) in rotation_matrices_offset(theta, phi, gg, gauge, angle).iter().enumerate() {
                 for (p, v) in stencil.iter().enumerate() {
                     (idx[p], wt[p]) = interp_weights_nested(apply(r, v), order);
                 }
@@ -297,6 +324,8 @@ pub enum ConvPlan {
         g: usize,
         /// Orientation convention.
         gauge: Gauge,
+        /// Per-pixel stencil offsets of the orientation-aligned frame.
+        angles: Option<AngleField>,
     },
 }
 
@@ -304,6 +333,22 @@ impl ConvPlan {
     /// Holds the whole geometry, or the `Chunked` form when `chunk` is
     /// smaller than the number of `rows` (sub-blocks of at least one row).
     pub fn new(grid: &[i64], rows: &[i64], nside: i64, kernel_sz: usize, g: usize, gauge: Gauge, chunk: Option<usize>) -> Self {
+        Self::new_rotated(grid, rows, nside, kernel_sz, g, gauge, None, chunk)
+    }
+
+    /// [`new`](Self::new) on the orientation-aligned frame: `angles` are the
+    /// per-pixel stencil offsets at the level of `rows` (ADR 0002).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_rotated(
+        grid: &[i64],
+        rows: &[i64],
+        nside: i64,
+        kernel_sz: usize,
+        g: usize,
+        gauge: Gauge,
+        angles: Option<AngleField>,
+        chunk: Option<usize>,
+    ) -> Self {
         match chunk {
             Some(c) if c < rows.len() => ConvPlan::Chunked {
                 grid: grid.to_vec(),
@@ -313,8 +358,9 @@ impl ConvPlan {
                 kernel_sz,
                 g,
                 gauge,
+                angles,
             },
-            _ => ConvPlan::Whole(ConvGeometry::rows(grid, rows, nside, kernel_sz, g, gauge)),
+            _ => ConvPlan::Whole(ConvGeometry::rows_rotated(grid, rows, nside, kernel_sz, g, gauge, angles.as_deref().map(|v| &**v))),
         }
     }
 
@@ -339,10 +385,10 @@ impl ConvPlan {
     fn each_chunk(&self, sel: Option<&[usize]>, mut f: impl FnMut(&ConvGeometry, Option<&[usize]>, usize)) {
         match self {
             ConvPlan::Whole(geo) => f(geo, sel, 0),
-            ConvPlan::Chunked { grid, rows, chunk, nside, kernel_sz, g, gauge } => {
+            ConvPlan::Chunked { grid, rows, chunk, nside, kernel_sz, g, gauge, angles } => {
                 let ids: Vec<i64> = sel.map_or_else(|| rows.clone(), |s| s.iter().map(|&i| rows[i]).collect());
                 for (i, part) in ids.chunks(*chunk).enumerate() {
-                    let geo = ConvGeometry::rows(grid, part, *nside, *kernel_sz, *g, *gauge);
+                    let geo = ConvGeometry::rows_rotated(grid, part, *nside, *kernel_sz, *g, *gauge, angles.as_deref().map(|v| &**v));
                     f(&geo, None, i * chunk);
                 }
             }

@@ -110,7 +110,8 @@ class NativeEngine:
     """
     def __init__(self, nside, j, batch=1, backend="cpu", kernel=5,
                  orientations=4, block_pixels=4096, cache_bytes=1 << 30,
-                 threads=1, cache="transposition", device=0, library=None):
+                 threads=1, cache="transposition", device=0, library=None,
+                 rotation=None):
         self._lib = _library(library)
         self.library_sha256 = self._lib._stlp_binary_sha256
         self._handle = None
@@ -128,6 +129,11 @@ class NativeEngine:
                            backend=backend, kernel=int(kernel), orientations=int(orientations),
                            block_pixels=int(block_pixels), cache_bytes=int(cache_bytes),
                            threads=int(threads), cache=cache, device=int(device))
+        if rotation is not None:
+            # Orientation-aligned frame (ADR 0002): the angle_dg<d>.npy files of this
+            # directory.  Absent: the sky frame.
+            self.config["rotation"] = str(rotation)
+        self.rotation = None if rotation is None else str(rotation)
         self._handle = self._lib.stlp_new(json.dumps(self.config).encode())
         if not self._handle:
             raise _error(self._lib)

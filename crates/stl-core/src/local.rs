@@ -12,7 +12,7 @@
 //! is `[R, |ids|]` for `R` leading rows (batch x channels x ...), a
 //! wavelet field is complex `[R, L, |ids|]`.
 
-use crate::conv::{ConvPlan, Kernel};
+use crate::conv::{AngleField, ConvPlan, Kernel};
 use crate::decimation::{smooth_decimation, Csr, DecimationParams};
 use crate::healpix::npix;
 use crate::neighbours::{dilate_fine, parents};
@@ -94,6 +94,9 @@ pub struct LocalGeometry {
     /// Rebuild the convolution geometry by sub-blocks of this many output
     /// rows at every application instead of holding it for the whole block.
     pub conv_chunk: Option<usize>,
+    /// Per-level per-pixel stencil offsets of the orientation-aligned frame,
+    /// in radians (`rotation[dg][p]`, one array per level, `None`: sky frame).
+    pub rotation: Option<Vec<AngleField>>,
 }
 
 impl LocalGeometry {
@@ -112,7 +115,20 @@ impl LocalGeometry {
             conv_rings: ((kernel_sz - 1) / 2 + 2) as u32,
             down_params: DecimationParams::default(),
             conv_chunk: None,
+            rotation: None,
         }
+    }
+
+    /// Installs the orientation-aligned frame: `angles[dg]` holds one offset
+    /// per pixel at level `dg` (radians, NESTED id order).  Levels absent
+    /// from `angles` keep the sky frame.
+    pub fn set_rotation(&mut self, angles: Vec<Vec<f32>>) {
+        self.rotation = Some(angles.into_iter().map(std::sync::Arc::new).collect());
+    }
+
+    /// Offsets of level `dg`, or `None` when that level keeps the sky frame.
+    pub fn angles(&self, dg: usize) -> Option<AngleField> {
+        self.rotation.as_ref().and_then(|r| r.get(dg)).cloned()
     }
 
     /// `nside` of level `dg`, `nside0 >> dg`.
@@ -152,7 +168,16 @@ impl LocalGeometry {
     /// Convolution of level `dg` from the grid `grid` to the output `rows`
     /// (geometry by sub-blocks of `conv_chunk` rows when set).
     pub fn conv_plan(&self, dg: usize, grid: &[i64], rows: &[i64]) -> ConvPlan {
-        ConvPlan::new(grid, rows, self.nside(dg), self.kernel_sz, self.l, self.gauge, self.conv_chunk)
+        ConvPlan::new_rotated(
+            grid,
+            rows,
+            self.nside(dg),
+            self.kernel_sz,
+            self.l,
+            self.gauge,
+            self.angles(dg),
+            self.conv_chunk,
+        )
     }
 
     /// Wavelet of `x_level` `[R, N_dg]` on `block`: `z` `[R, L, |block|]`.

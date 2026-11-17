@@ -68,6 +68,8 @@ run:
 both:
   --physical-only      four physical blocks; requires its own physical calibration
   --sc-only            only physical SC; requires --physical-only and a fresh SC-only calibration
+  --rotation DIR        orientation-aligned frame: the per-level angle_dg<d>.npy of DIR
+                        (stl-rotation); the same DIR on calibrate and run
   --block-pixels N      CPU engine block (default 16384)
   --ranks N             thread ranks (builds without MPI)
   --gpu, --gpu-conv F, --gpu-fields F, --gpu-cache C, --geometry-cache P, --gpu-block-rows N
@@ -123,6 +125,8 @@ pub struct Args {
     pub checkpoint: usize,
     /// `--out`: calibration JSON (`calibrate`) or output prefix (`run`).
     pub out: Option<String>,
+    /// `--rotation`: directory of the orientation-aligned frame (ADR 0002).
+    pub rotation: Option<PathBuf>,
     /// `--block-pixels`: CPU engine block (default 16384).
     pub block_pixels: usize,
     /// `--ranks`: thread ranks in builds without MPI (default 1).
@@ -195,6 +199,7 @@ impl Args {
                 "--history-size" => a.history_size = num(it.next(), k)?,
                 "--checkpoint" => a.checkpoint = num(it.next(), k)?,
                 "--out" => a.out = Some(it.next().ok_or("--out needs a value")?.clone()),
+                "--rotation" => a.rotation = Some(it.next().ok_or("--rotation needs a directory")?.into()),
                 "--block-pixels" => a.block_pixels = num(it.next(), k)?,
                 "--ranks" => a.ranks = num(it.next(), k)?,
                 "--quiet" => a.quiet = true,
@@ -244,6 +249,21 @@ pub fn setup(nside: usize, scales: usize, block_pixels: usize) -> (LocalGeometry
     let cfg = EngineConfig::new(scales, false);
     let plan = build_plan(scales, 4, &cfg.j_to_dg, 1, None, &Family::ALL);
     (geo, cfg, plan)
+}
+
+/// [`setup`], on the orientation-aligned frame of `rotation` when given
+/// (ADR 0002).  The same geometry serves the calibration and the run.
+pub fn setup_rotated(
+    nside: usize,
+    scales: usize,
+    block_pixels: usize,
+    rotation: Option<&std::path::Path>,
+) -> Result<(LocalGeometry, EngineConfig, Vec<Coefficient>), String> {
+    let (mut geo, cfg, plan) = setup(nside, scales, block_pixels);
+    if let Some(dir) = rotation {
+        geo.set_rotation(stl_mpi::io::read_rotation(dir, nside as i64)?);
+    }
+    Ok((geo, cfg, plan))
 }
 
 fn splitmix(mut x: u64) -> u64 {
@@ -314,7 +334,7 @@ pub fn run_calibrate<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
         println!("[stl-ensemble] physical-only version 1.1.0 (2026-11-04): calibration (sc_only={})", args.sc_only);
     }
     let scales = nside.ilog2() as usize + 1;
-    let (geo, cfg, plan) = setup(nside, scales, args.block_pixels);
+    let (geo, cfg, plan) = setup_rotated(nside, scales, args.block_pixels, args.rotation.as_deref())?;
     let mut physical = Vec::new();
     for p in &args.references {
         let x = read_map(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -394,7 +414,7 @@ pub fn run_synthesis<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
     let gcomm: &C = group.as_ref().unwrap_or(comm);
     let local = members / groups;
     let first = group_id * local;
-    let (geo, cfg, plan) = setup(nside, cal.scales, args.block_pixels);
+    let (geo, cfg, plan) = setup_rotated(nside, cal.scales, args.block_pixels, args.rotation.as_deref())?;
     let dummy = vec![Complex64::new(0.0, 0.0); local * plan.len()];
     #[allow(unused_mut)]
     let mut og = Objective::new(&geo, &cfg, &plan, &dummy, local, 1, gcomm);
