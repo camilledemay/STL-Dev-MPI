@@ -12,6 +12,9 @@
 //! bands, the CIC PDF and the Minkowski functionals of kappa on the host.
 //! Every block compares the mean over the members with the target mean and
 //! their variance with the population variance.
+//! Physical-only calibrations instead use `kappa = x - mean(x)`, omit the
+//! Gaussian block completely, and divide the four retained blocks by four.
+//! With `sc_only`, only physical SC is evaluated, with no division by four.
 //!
 //! Members are split over groups of ranks as in `stl-synth` (`--groups`):
 //! the features of every member are gathered over `cross` before the
@@ -43,6 +46,16 @@ pub const BLOCKS: [&str; 5] = ["gaussian_sc", "physical_sc", "power", "pdf", "mf
 /// forward and the reverse pass (4 GiB: nside 2048 recomputes them).
 const MF_STATE_BYTES: usize = 4 << 30;
 
+fn band_windows(lmax: usize, physical_only: bool) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let (windows, mut centers) = lp_windows(lmax);
+    if physical_only {
+        // exp(log(6143)) can exceed 6143 by a few ulps, excluding the
+        // final band from the requested variance cutoff. Windows are unchanged.
+        *centers.last_mut().unwrap() = lmax as f64;
+    }
+    (windows, centers)
+}
+
 /// The five-block ensemble objective on this group's members (see the
 /// module header).
 pub struct EnsembleObjective<'o, 'a, C: Comm> {
@@ -62,7 +75,7 @@ pub struct EnsembleObjective<'o, 'a, C: Comm> {
     /// Index of this group's first member.
     pub first_member: usize,
     coords: ScCoordinates,
-    sht: Sht,
+    sht: Option<Sht>,
     windows: Vec<Vec<f64>>,
     centers: Vec<f64>,
     cic: Cic,
@@ -109,9 +122,12 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
         if members < 2 {
             return Err("the population losses need at least two members".into());
         }
+        if cal.sc_only && !cal.physical_only {
+            return Err("SC-only requires a physical-only calibration".into());
+        }
         let lmax = 3 * nside - 1;
-        let (windows, centers) = lp_windows(lmax);
-        if !(20.0..=lmax as f64).contains(&cutoff) {
+        let (windows, centers) = if cal.sc_only { (vec![], vec![]) } else { band_windows(lmax, cal.physical_only) };
+        if !cal.sc_only && !(20.0..=lmax as f64).contains(&cutoff) {
             return Err(format!("C_l variance cutoff {cutoff} outside [20, {lmax}]"));
         }
         let t = &cal.targets;
@@ -124,10 +140,10 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
             members,
             first_member,
             coords: ScCoordinates::new(plan, nside)?,
-            sht: Sht::new(nside, lmax),
+            sht: if cal.sc_only { None } else { Some(Sht::new(nside, lmax)) },
             windows,
             centers,
-            cic: Cic::new(t.pdf_support[0], t.pdf_support[1], 100),
+            cic: if cal.sc_only { Cic::new(0.0, 1.0, 100) } else { Cic::new(t.pdf_support[0], t.pdf_support[1], 100) },
             mk: Minkowski::default(),
             cutoff,
             npix: 12 * nside * nside,
@@ -190,11 +206,16 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
     /// the host threads, each member's mean summed in pixel order.
     pub fn physical(&self, g: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let (mut k, mut d) = (vec![0.0; g.len()], vec![0.0; g.len()]);
-        par_zip(&mut k, &mut d, |lo, ks, ds| {
-            for (i, (a, b)) in ks.iter_mut().zip(ds.iter_mut()).enumerate() {
-                (*a, *b) = self.cal.lut.inverse(g[lo + i]);
-            }
-        });
+        if self.cal.physical_only {
+            k.copy_from_slice(g);
+            d.fill(1.0);
+        } else {
+            par_zip(&mut k, &mut d, |lo, ks, ds| {
+                for (i, (a, b)) in ks.iter_mut().zip(ds.iter_mut()).enumerate() {
+                    (*a, *b) = self.cal.lut.inverse(g[lo + i]);
+                }
+            });
+        }
         let means: Vec<f64> = k.chunks(self.npix).map(|row| row.iter().sum::<f64>() / self.npix as f64).collect();
         let npix = self.npix;
         par_chunks(&mut k, |lo, ks| ks.iter_mut().enumerate().for_each(|(i, v)| *v -= means[(lo + i) / npix]));
@@ -228,12 +249,13 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
     /// Band powers, CIC and Minkowski functionals of the members' whole
     /// physical maps on the host, and what their cotangents need.
     fn host_forward(&self, kfull: &[f64], kept: &mut HostPass) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let sht = self.sht.as_ref().expect("harmonic terms enabled");
         let t = Instant::now();
         let local = self.local();
         let mut pw = Vec::with_capacity(local * self.windows.len());
         let mut hist = Vec::with_capacity(local * self.cic.bins);
         for row in kfull.chunks(self.npix) {
-            let (p, a) = band_powers(&self.sht, &self.windows, row);
+            let (p, a) = band_powers(sht, &self.windows, row);
             pw.extend(p);
             kept.alms.push(a);
             hist.extend(self.cic.forward(row));
@@ -245,7 +267,7 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
         let keep = local * self.npix * 6 * 8 <= MF_STATE_BYTES;
         let mut mfv = Vec::with_capacity(local * self.mk.count());
         for row in kfull.chunks(self.npix) {
-            let (v, s) = self.mk.forward(&self.sht, row);
+            let (v, s) = self.mk.forward(sht, row);
             mfv.extend(v);
             if keep {
                 kept.states.push(s);
@@ -258,11 +280,12 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
     /// Map cotangents `[local, npix]` on the host from the cotangents of this
     /// group's members' band powers, CIC and functionals.
     fn host_reverse(&self, kfull: &[f64], kept: HostPass, cps: &[f64], cpdf: &[f64], cmf: &[f64]) -> Vec<f64> {
+        let sht = self.sht.as_ref().expect("harmonic terms enabled");
         let (nb, bins, nm) = (self.windows.len(), self.cic.bins, self.mk.count());
         let t = Instant::now();
         let mut hk = vec![0.0; self.local() * self.npix];
         for (m, row) in kfull.chunks(self.npix).enumerate() {
-            let g1 = band_powers_vjp(&self.sht, &self.windows, &kept.alms[m], &cps[m * nb..(m + 1) * nb]);
+            let g1 = band_powers_vjp(sht, &self.windows, &kept.alms[m], &cps[m * nb..(m + 1) * nb]);
             let g2 = self.cic.vjp(row, &cpdf[m * bins..(m + 1) * bins]);
             let out = &mut hk[m * self.npix..(m + 1) * self.npix];
             out.iter_mut().zip(g1.iter().zip(&g2)).for_each(|(o, (p, q))| *o = p + q);
@@ -273,9 +296,9 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
         for (m, row) in kfull.chunks(self.npix).enumerate() {
             let state = match states.next() {
                 Some(s) => s,
-                None => self.mk.forward(&self.sht, row).1,
+                None => self.mk.forward(sht, row).1,
             };
-            let g3 = self.mk.vjp(&self.sht, &state, &cmf[m * nm..(m + 1) * nm]);
+            let g3 = self.mk.vjp(sht, &state, &cmf[m * nm..(m + 1) * nm]);
             hk[m * self.npix..(m + 1) * self.npix].iter_mut().zip(g3).for_each(|(o, v)| *o += v);
         }
         self.tick("mf_reverse", t);
@@ -285,7 +308,9 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
     /// Runs the harmonic terms on `gpu` (`--harmonic gpu`).
     #[cfg(feature = "gpu")]
     pub fn use_device_terms(&mut self, gpu: std::sync::Arc<stl_gpu::Gpu>) -> Result<(), String> {
-        self.gpu_terms = Some(RefCell::new(GpuTerms::new(gpu, &self.sht, &self.mk)?));
+        if !self.cal.sc_only {
+            self.gpu_terms = Some(RefCell::new(GpuTerms::new(gpu, self.sht.as_ref().expect("harmonic terms enabled"), &self.mk)?));
+        }
         Ok(())
     }
 
@@ -334,50 +359,76 @@ impl<'o, 'a, C: Comm> EnsembleObjective<'o, 'a, C> {
         let kx = self.owned(&kfull);
         self.tick("host_physical_map", t0);
         let t = Instant::now();
-        let (gsc, mut grad) = self.sc_block(self.g, x, false);
-        self.tick("gaussian_sc", t);
+        let (gsc, mut grad) = if self.cal.physical_only {
+            (Block::default(), vec![0.0; x.len()])
+        } else {
+            let out = self.sc_block(self.g, x, false);
+            self.tick("gaussian_sc", t);
+            out
+        };
         let t = Instant::now();
         let (psc, mut gk) = self.sc_block(self.k, &kx, true);
         self.tick("physical_sc", t);
-        // Harmonic features of this group's members (on the device with
-        // `--harmonic gpu`), gathered over the groups.
         let local = self.local();
-        let (nb, bins, nm) = (self.windows.len(), self.cic.bins, self.mk.count());
-        let mut kept = HostPass::default();
-        let (pw, hist, mfv) = match self.device_forward(&kfull) {
-            Some(f) => f,
-            None => self.host_forward(&kfull, &mut kept),
-        };
-        let tg = &self.cal.targets;
-        let (ps, cps) = power_loss(&self.gather_rows(&pw, nb), &tg.power_mean, &tg.power_var, &self.centers, self.cutoff).expect("C_l block");
-        let (pdf, cpdf) = pdf_loss(&self.gather_rows(&hist, bins), &tg.pdf_mean, &tg.pdf_var);
-        let (mf, cmf) = mf_loss(&self.gather_rows(&mfv, nm), &tg.mf_mean, &tg.mf_var);
-        let (a, b) = (self.first_member, self.first_member + local);
-        let (cps, cpdf, cmf) = (&cps[a * nb..b * nb], &cpdf[a * bins..b * bins], &cmf[a * nm..b * nm]);
-        let hk = match self.device_reverse(&kfull, cps, cpdf, cmf) {
-            Some(h) => h,
-            None => self.host_reverse(&kfull, kept, cps, cpdf, cmf),
+        let (ps, pdf, mf) = if self.cal.sc_only {
+            // No feature evaluation, cotangents, whole-map harmonic buffers
+            // or feature collectives for the disabled blocks.
+            (Block::default(), Block::default(), Block::default())
+        } else {
+            // Harmonic features of this group's members (on the device with
+            // `--harmonic gpu`), gathered over the groups.
+            let (nb, bins, nm) = (self.windows.len(), self.cic.bins, self.mk.count());
+            let mut kept = HostPass::default();
+            let (pw, hist, mfv) = match self.device_forward(&kfull) {
+                Some(f) => f,
+                None => self.host_forward(&kfull, &mut kept),
+            };
+            let tg = &self.cal.targets;
+            let (ps, cps) = power_loss(&self.gather_rows(&pw, nb), &tg.power_mean, &tg.power_var, &self.centers, self.cutoff).expect("C_l block");
+            let (pdf, cpdf) = pdf_loss(&self.gather_rows(&hist, bins), &tg.pdf_mean, &tg.pdf_var);
+            let (mf, cmf) = mf_loss(&self.gather_rows(&mfv, nm), &tg.mf_mean, &tg.mf_var);
+            let (a, b) = (self.first_member, self.first_member + local);
+            let (cps, cpdf, cmf) = (&cps[a * nb..b * nb], &cpdf[a * bins..b * bins], &cmf[a * nm..b * nm]);
+            let hk = match self.device_reverse(&kfull, cps, cpdf, cmf) {
+                Some(h) => h,
+                None => self.host_reverse(&kfull, kept, cps, cpdf, cmf),
+            };
+            let hk = self.owned(&hk);
+            par_chunks(&mut gk, |lo, gs| gs.iter_mut().enumerate().for_each(|(i, a)| *a += hk[lo + i]));
+            (ps, pdf, mf)
         };
         // kappa cotangent -> g: f'(g) (c - mean(c)), member by member.
         let t = Instant::now();
-        let hk = self.owned(&hk);
-        par_chunks(&mut gk, |lo, gs| gs.iter_mut().enumerate().for_each(|(i, a)| *a += hk[lo + i]));
         let owned = gk.len() / local.max(1);
         let sums: Vec<f64> = gk.chunks(owned.max(1)).map(|r| r.iter().sum()).collect();
         let mut sums = sums;
         self.g.comm.allreduce_sum(&mut sums);
         let sl = self.owned(&slope);
         let npix = self.npix as f64;
+        let norm = if self.cal.sc_only { 1.0 } else if self.cal.physical_only { 4.0 } else { 5.0 };
         par_chunks(&mut grad, |lo, gs| {
             for (i, v) in gs.iter_mut().enumerate() {
                 let p = lo + i;
-                *v = (*v + sl[p] * (gk[p] - sums[p / owned.max(1)] / npix)) / 5.0;
+                *v = (*v + sl[p] * (gk[p] - sums[p / owned.max(1)] / npix)) / norm;
             }
         });
         self.tick("host_chain", t);
         let blocks = [gsc, psc, ps, pdf, mf];
         *self.last.borrow_mut() = blocks;
         self.tick("evaluation", t0);
-        (blocks.iter().map(|b| b.loss).sum::<f64>() / 5.0, grad)
+        (blocks.iter().map(|b| b.loss).sum::<f64>() / norm, grad)
+    }
+}
+
+#[cfg(test)]
+mod physical_tests {
+    #[test]
+    fn physical_only_includes_the_last_power_band() {
+        let (legacy_windows, legacy_centers) = super::lp_windows(6143);
+        let (windows, centers) = super::band_windows(6143, true);
+        assert_eq!(windows, legacy_windows);
+        assert_eq!(centers[..15], legacy_centers[..15]);
+        assert_eq!(centers[15], 6143.0);
+        assert_eq!(super::band_windows(6143, false).1, legacy_centers);
     }
 }

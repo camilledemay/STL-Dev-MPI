@@ -158,6 +158,8 @@ fn fixture_calibration() -> Calibration {
     let m = meta(case);
     let sup = g("pdf_support");
     Calibration {
+        physical_only: false,
+        sc_only: false,
         nside: m["nside"].as_u64().unwrap() as usize,
         scales: m["scales"].as_u64().unwrap() as usize,
         orientations: 4,

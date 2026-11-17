@@ -1,6 +1,6 @@
 //! `stl-ensemble calibrate | run`: the command of the ensemble objective.
 
-use super::calibration::{calibrate, degrade, Calibration};
+use super::calibration::{calibrate, calibrate_physical, calibrate_physical_sc, degrade, Calibration};
 use super::objective::{EnsembleObjective, BLOCKS};
 use crate::{pixel_normal, proc_memory};
 use num_complex::Complex64;
@@ -32,6 +32,13 @@ functionals of kappa, each on the mean over the members (against the mean of a
 bootstrap draw of the references) and on their variance (against the variance
 of the references).  See docs/campeti_merge.md.
 
+Physical-only v1.1.0 (2026-11-04): add --physical-only to BOTH commands.
+The variable is kappa, with its mean removed; no LUT or Gaussian SC is used.
+  L = (L_PSC + L_PS + L_PDF + L_MF) / 4
+The calibration uses centered physical references and their physical C_l.
+Add --sc-only to BOTH commands as well to keep only L_PSC (mean and variance).
+PS, PDF and MF are then skipped entirely; C_l is used only for initialization.
+
 calibrate:
   --references MAP...   reference maps (NESTED .npy / .fits, nside >= N), until the next option
   --nside N             nside of the synthesis (the maps are block-averaged: via 512 in f32)
@@ -45,18 +52,22 @@ run:
   --niter N             L-BFGS iterations; --max-eval N evaluations (default 5 N / 4)
   --ensemble B          members (default 10, the calibration's draw size)
   --groups G            MPI groups of ranks sharing B / G members (default 1)
-  --init MAP            Gaussian maps of the members ('{m}': one per member); default Gaussian
+  --init MAP            optimization maps ('{m}': one per member), physical with --physical-only;
+                        otherwise Gaussian coordinates; default Gaussian
                         random fields with the mean C_l of the drawn references (--seed + m)
   --seed N              default 61022026
   --ps-variance-upper X upper band centre of the C_l variance term (default 383 at nside 128;
-                        required otherwise)
+                        required otherwise, ignored with --sc-only)
   --history-size N      L-BFGS history (default 10)
   --checkpoint N        every N evaluations, the maps of the lowest loss so far: PREFIX_checkpoint_mMMM_*
                         and PREFIX_checkpoint.json (restart with --init PREFIX_checkpoint_m{m}_gaussian_nested.npy)
   --harmonic cpu|gpu    where the C_l, PDF and Minkowski terms run (default gpu with --gpu;
-                        the device needs cuFFT, libcufft.so or STL_CUFFT)
-  --out PREFIX          PREFIX.json, PREFIX_mMMM_gaussian_nested.npy, PREFIX_mMMM_physical_nested.npy
+                        the device needs cuFFT, libcufft.so or STL_CUFFT; ignored with --sc-only)
+  --out PREFIX          PREFIX.json, PREFIX_mMMM_physical_nested.npy; also Gaussian maps
+                        in the original mode (omitted with --physical-only)
 both:
+  --physical-only      four physical blocks; requires its own physical calibration
+  --sc-only            only physical SC; requires --physical-only and a fresh SC-only calibration
   --block-pixels N      CPU engine block (default 16384)
   --ranks N             thread ranks (builds without MPI)
   --gpu, --gpu-conv F, --gpu-fields F, --gpu-cache C, --geometry-cache P, --gpu-block-rows N
@@ -67,6 +78,10 @@ both:
 /// Options of `stl-ensemble` (see [`USAGE`]).
 #[derive(Clone, Debug, Default)]
 pub struct Args {
+    /// Direct physical variable and the four physical loss blocks.
+    pub physical_only: bool,
+    /// Only physical SC; requires `physical_only` on calibrate and run.
+    pub sc_only: bool,
     /// The command: `calibrate` or `run`.
     pub command: String,
     /// `--references`: reference maps (NESTED `.npy` / `.fits`), up to the
@@ -153,6 +168,8 @@ impl Args {
         let num = |v: Option<&String>, k: &str| -> Result<usize, String> { v.ok_or(format!("{k} needs a value"))?.parse().map_err(|_| format!("{k}: not an integer")) };
         while let Some(k) = it.next() {
             match k.as_str() {
+                "--physical-only" => a.physical_only = true,
+                "--sc-only" => a.sc_only = true,
                 "--references" => {
                     while let Some(v) = it.peek() {
                         if v.starts_with("--") {
@@ -202,10 +219,16 @@ impl Args {
             "calibrate" if a.references.len() < 2 || a.nside == 0 || a.out.is_none() => Err("calibrate needs --references (two or more), --nside and --out".into()),
             "run" if a.calibration.is_none() || a.out.is_none() => Err("run needs --calibration and --out".into()),
             "calibrate" | "run" => {
+                if a.sc_only && !a.physical_only {
+                    return Err("--sc-only requires --physical-only on both calibrate and run".into());
+                }
+                if a.physical_only && (a.ensemble < 2 || a.groups == 0 || a.history_size == 0) {
+                    return Err("physical-only: ensemble >= 2, groups >= 1 and history-size >= 1 required".into());
+                }
                 if a.gpu && !cfg!(feature = "gpu") {
                     return Err("--gpu: built without the feature gpu".into());
                 }
-                if a.harmonic_gpu == Some(true) && !a.gpu {
+                if a.harmonic_gpu == Some(true) && !a.gpu && !a.sc_only {
                     return Err("--harmonic gpu needs --gpu".into());
                 }
                 Ok(a)
@@ -284,6 +307,12 @@ mod device {
 pub fn run_calibrate<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json::Value>, String> {
     let started = Instant::now();
     let nside = args.nside;
+    if args.physical_only && (nside < 8 || !nside.is_power_of_two()) {
+        return Err("physical-only: nside must be a power of two, at least 8".into());
+    }
+    if args.physical_only && comm.rank() == 0 {
+        println!("[stl-ensemble] physical-only version 1.1.0 (2026-11-04): calibration (sc_only={})", args.sc_only);
+    }
     let scales = nside.ilog2() as usize + 1;
     let (geo, cfg, plan) = setup(nside, scales, args.block_pixels);
     let mut physical = Vec::new();
@@ -312,7 +341,13 @@ pub fn run_calibrate<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
         probe.set_evaluator(Box::new(ev));
     }
     let names = args.references.iter().map(|p| p.display().to_string()).collect();
-    let cal = calibrate(&physical, names, ids, &plan, scales, args.knots, |x| probe.statistics_moments(&probe.slice(x)))?;
+    let cal = if args.sc_only {
+        calibrate_physical_sc(&physical, names, ids, &plan, scales, |x| probe.statistics_moments(&probe.slice(x)))?
+    } else if args.physical_only {
+        calibrate_physical(&physical, names, ids, &plan, scales, |x| probe.statistics_moments(&probe.slice(x)))?
+    } else {
+        calibrate(&physical, names, ids, &plan, scales, args.knots, |x| probe.statistics_moments(&probe.slice(x)))?
+    };
     if comm.rank() == 0 {
         let out = args.out.as_ref().unwrap();
         std::fs::write(out, serde_json::to_string(&cal.to_json()).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"))?;
@@ -329,12 +364,20 @@ pub fn run_synthesis<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
     let path = args.calibration.as_ref().unwrap();
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cal = Calibration::from_json(&serde_json::from_str(&text).map_err(|e| e.to_string())?)?;
+    if cal.physical_only != args.physical_only || cal.sc_only != args.sc_only {
+        return Err("calibration mode mismatch: use the same --physical-only / --sc-only flags for calibrate and run; recalibrate when changing losses".into());
+    }
+    let active = if cal.sc_only { 1..2 } else if cal.physical_only { 1..5 } else { 0..5 };
+    let restart_kind = if cal.physical_only { "physical" } else { "gaussian" };
+    if cal.physical_only && comm.rank() == 0 {
+        println!("[stl-ensemble] physical-only version 1.1.0 (2026-11-04): {}", if cal.sc_only { "[physical_sc]" } else { "[physical_sc, power, pdf, mf] / 4" });
+    }
     let nside = cal.nside;
-    let cutoff = match (args.ps_variance_upper, nside) {
+    let cutoff = if cal.sc_only { 0.0 } else { match (args.ps_variance_upper, nside) {
         (Some(x), _) => x,
         (None, 128) => 383.0,
         _ => return Err("--ps-variance-upper: required at this nside (383 is the source's value at 128)".into()),
-    };
+    }};
     let (members, groups) = (args.ensemble, args.groups);
     if members % groups != 0 || comm.size() % groups != 0 {
         return Err(format!("--groups {groups} must divide --ensemble {members} and the number of ranks {}", comm.size()));
@@ -430,6 +473,9 @@ pub fn run_synthesis<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
             for (m, (gr, kr)) in g.chunks(npix).zip(kappa.chunks(npix)).enumerate() {
                 let id = first + m;
                 for (kind, map) in [("gaussian", gr), ("physical", kr)] {
+                    if cal.physical_only && kind == "gaussian" {
+                        continue;
+                    }
                     let path = format!("{prefix}_m{id:03}_{kind}_nested.npy");
                     write_npy(&PathBuf::from(format!("{path}.tmp")), map).map_err(|e| e.to_string())?;
                     std::fs::rename(format!("{path}.tmp"), &path).map_err(|e| format!("{path}: {e}"))?;
@@ -458,9 +504,10 @@ pub fn run_synthesis<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
                 let ck = format!("{prefix}_checkpoint");
                 match write_members(&best.1, &ck) {
                     Ok(()) if root => {
-                        let state = json!({"evaluation": best.2, "loss": best.0, "blocks": blocks_history.borrow()[best.2 - 1],
+                        let state = json!({"evaluation": best.2, "loss": best.0, "blocks": blocks_history.borrow()[best.2 - 1][active.clone()].to_vec(),
+                            "block_names": &BLOCKS[active.clone()], "physical_only": cal.physical_only, "sc_only": cal.sc_only,
                             "evaluations_done": n, "seconds": started.elapsed().as_secs_f64(),
-                            "restart": format!("--init {ck}_m{{m}}_gaussian_nested.npy")});
+                            "restart": format!("--init {ck}_m{{m}}_{restart_kind}_nested.npy")});
                         if let Err(e) = std::fs::write(format!("{ck}.json"), serde_json::to_string_pretty(&state).unwrap()) {
                             eprintln!("stl-ensemble: {ck}.json: {e}");
                         }
@@ -479,7 +526,7 @@ pub fn run_synthesis<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
             println!(
                 "[stl-ensemble] evaluation {:4}  loss = {loss:.10e}  blocks = [{}]  t = {t:8.1} s",
                 i + 1,
-                b.iter().map(|v| format!("{:.6e}", v.loss)).collect::<Vec<_>>().join(", ")
+                b[active.clone()].iter().map(|v| format!("{:.6e}", v.loss)).collect::<Vec<_>>().join(", ")
             );
         }
     };
@@ -501,15 +548,16 @@ pub fn run_synthesis<C: Comm>(args: &Args, comm: &C) -> Result<Option<serde_json
     let evals = eval_seconds.borrow();
     let per_eval = if evals.len() > 1 { evals[1..].iter().sum::<f64>() / (evals.len() - 1) as f64 } else { evals.first().copied().unwrap_or(0.0) };
     let report = json!({
-        "method": "P. Campeti, STL_ensemble v2 (variance ratio), five blocks, ported to Rust",
+        "method": if cal.sc_only { "Physical-only v1.1.0 (2026-11-04), physical SC only, centered physical variable" } else if cal.physical_only { "Physical-only v1.1.0 (2026-11-04), four blocks, centered physical variable" } else { "P. Campeti, STL_ensemble v2 (variance ratio), five blocks, ported to Rust" },
+        "physical_only": cal.physical_only, "sc_only": cal.sc_only,
         "nside": nside, "scales": cal.scales, "orientations": 4, "kernel": 5, "members": members, "groups": groups,
         "ranks": comm.size(), "calibration": path, "references": cal.references, "bootstrap_ids": cal.bootstrap_ids,
-        "ps_variance_upper": cutoff, "niter": args.niter, "max_eval": args.max_eval, "history_size": args.history_size,
-        "checkpoint": args.checkpoint, "init": args.init, "seed": seed, "gpu": gpu_info, "harmonic": if obj.device_terms() { "gpu" } else { "cpu" },
+        "ps_variance_upper": if cal.sc_only { serde_json::Value::Null } else { json!(cutoff) }, "niter": args.niter, "max_eval": args.max_eval, "history_size": args.history_size,
+        "checkpoint": args.checkpoint, "init": args.init, "seed": seed, "gpu": gpu_info, "harmonic": if cal.sc_only { "disabled" } else if obj.device_terms() { "gpu" } else { "cpu" },
         "evaluations": history.len(), "seconds": seconds, "setup_seconds": setup_seconds,
         "seconds_per_evaluation": per_eval, "first_evaluation_seconds": evals.first(),
-        "loss_history": &history, "blocks": BLOCKS, "blocks_history": &*blocks_history.borrow(),
-        "loss_final": final_loss, "blocks_final": final_blocks.iter().map(|b| json!({"loss": b.loss, "mean": b.mean, "variance": b.variance})).collect::<Vec<_>>(),
+        "loss_history": &history, "blocks": &BLOCKS[active.clone()], "blocks_history": blocks_history.borrow().iter().map(|v| v[active.clone()].to_vec()).collect::<Vec<_>>(),
+        "loss_final": final_loss, "blocks_final": final_blocks[active.clone()].iter().map(|b| json!({"loss": b.loss, "mean": b.mean, "variance": b.variance})).collect::<Vec<_>>(),
         "timers_seconds": &*obj.timers.borrow(), "peak_rss_bytes_max_rank": peak, "device_memory": device_memory,
         "lbfgs_threads": std::env::var("STL_THREADS").ok(),
     });
